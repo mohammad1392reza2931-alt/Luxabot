@@ -16,6 +16,7 @@ const WELCOME =
   "📷 عکس که بفرستی، توی حافظه‌ی من می‌مونه. خودم تحلیلش می‌کنم و یه پریست حرفه‌ای مخصوص همون عکس می‌سازم. بعدش:\n" +
   "• با دکمه‌ها ویرایشش کن (پریست، استایل، بک‌گراند، وضوح، حذف اشیا)\n" +
   "• یا فقط بنویس! مثلاً «گرم‌ترش کن»، «بک‌گراندش رو بلور کن»، «ماشین پشتی رو حذف کن» یا «نورش چطوره؟»\n\n" +
+  "🪟 PNG با پس‌زمینه‌ی شفاف رو به‌صورت «فایل» بفرست (نه «عکس») تا شفافیتش حفظ بشه.\n\n" +
   "🗑 پاک کردن حافظه‌ی گفتگو: /new  |  نمایش دکمه‌ها: /menu\n\n";
 
 let TOKEN = "";
@@ -254,7 +255,49 @@ function describe(p) {
   if (p.grain > 0.05) L.push("🎞 گرین فیلم " + Math.round(p.grain * 100) + "%");
   return (p.note ? p.note + "\n\n" : "") + L.join("\n");
 }
-async function renderLook(env, buf, p, fancy) {
+// تشخیص اینکه PNG از قبل پس‌زمینه‌ی شفاف داره یا نه
+async function pngMinAlpha(u) {
+  let pos = 8, w = 0, h = 0, bd = 0, ct = 0, il = 0;
+  const parts = [];
+  const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+  while (pos + 8 <= u.length) {
+    const n = dv.getUint32(pos), t = String.fromCharCode(u[pos + 4], u[pos + 5], u[pos + 6], u[pos + 7]);
+    if (t === "IHDR") { w = dv.getUint32(pos + 8); h = dv.getUint32(pos + 12); bd = u[pos + 16]; ct = u[pos + 17]; il = u[pos + 20]; }
+    if (t === "IDAT") parts.push(u.subarray(pos + 8, pos + 8 + n));
+    pos += 12 + n;
+  }
+  if (bd !== 8 || il !== 0 || (ct !== 4 && ct !== 6) || !w || !h) return 0; // نامشخص: فرض می‌کنیم شفافه
+  const raw = new Uint8Array(await new Response(new Blob(parts).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer());
+  const bpp = ct === 6 ? 4 : 2, stride = w * bpp;
+  let prev = new Uint8Array(stride), minA = 255, o = 0;
+  for (let y = 0; y < h; y++) {
+    const f = raw[o++], cur = raw.slice(o, o + stride); o += stride;
+    for (let i = 0; i < stride; i++) {
+      const a = i >= bpp ? cur[i - bpp] : 0, b = prev[i], c = i >= bpp ? prev[i - bpp] : 0;
+      let x = cur[i];
+      if (f === 1) x += a; else if (f === 2) x += b; else if (f === 3) x += (a + b) >> 1;
+      else if (f === 4) { const pp = a + b - c, pa = Math.abs(pp - a), pb = Math.abs(pp - b), pc = Math.abs(pp - c); x += pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
+      cur[i] = x & 255;
+    }
+    for (let i = bpp - 1; i < stride; i += bpp) if (cur[i] < minA) minA = cur[i];
+    prev = cur;
+  }
+  return minA;
+}
+async function isTransparent(env, buf) {
+  try {
+    if (buf.byteLength < 33) return false;
+    const u = new Uint8Array(buf, 0, Math.min(buf.byteLength, 8192));
+    if (u[0] !== 137 || u[1] !== 80 || u[2] !== 78 || u[3] !== 71) return false;
+    const ct = u[25];
+    if (ct === 3) return String.fromCharCode.apply(null, u).includes("tRNS");
+    if (ct !== 4 && ct !== 6) return false;
+    const small = await (await env.IMAGES.input(bs(buf)).transform({ width: 32, height: 32, fit: "scale-down" })
+      .output({ format: "image/png" })).response().arrayBuffer();
+    return (await pngMinAlpha(new Uint8Array(small))) < 200;
+  } catch (e) { console.log("alpha check: " + e.message); return true; }
+}
+async function renderLook(env, buf, p, fancy, alpha) {
   const MAX = 2048;
   const info = await env.IMAGES.info(bs(buf));
   const sc = Math.min(1, MAX / Math.max(info.width, info.height));
@@ -262,7 +305,7 @@ async function renderLook(env, buf, p, fancy) {
   const adj = { brightness: p.brightness, contrast: p.contrast, gamma: p.gamma, saturation: p.saturation };
   if (p.sharpen > 0.05) adj.sharpen = p.sharpen;
   let img = env.IMAGES.input(bs(buf)).transform({ width: MAX, height: MAX, fit: "scale-down" }).transform(adj);
-  if (fancy) {
+  if (fancy && !alpha) {
     const layer = (png, opacity) => {
       img = img.draw(env.IMAGES.input(bs(png)).transform({ width: W, height: H, fit: "squeeze" }), { opacity, top: 0, left: 0 });
     };
@@ -272,20 +315,22 @@ async function renderLook(env, buf, p, fancy) {
     if (p.vignette > 0.05) layer(vignettePng(), Math.min(1, p.vignette));
     if (p.grain > 0.05) img = img.draw(env.IMAGES.input(bs(grainPng())), { opacity: Math.min(0.14, p.grain * 0.12), repeat: true });
   }
-  return (await img.output({ format: "image/jpeg", quality: 92 })).response().arrayBuffer();
+  return (await img.output(alpha ? { format: "image/png" } : { format: "image/jpeg", quality: 92 })).response().arrayBuffer();
 }
-async function doEnhance(env, buf, styleKey, thumb, pre) {
+async function doEnhance(env, buf, styleKey, thumb, pre, alpha) {
   thumb = thumb || (await makeThumb(env, buf));
-  const p = pre || (await makePreset(env, thumb, styleKey));
+  const p0 = pre || (await makePreset(env, thumb, styleKey));
+  const p = alpha ? { ...p0, warmth: 0, tint: 0, fade: 0, vignette: 0, grain: 0 } : p0; // روی PNG شفاف افکت تمام‌کادر اعمال نمی‌شه
   let bytes, note = "";
-  try { bytes = await renderLook(env, buf, p, true); }
+  try { bytes = await renderLook(env, buf, p, true, alpha); }
   catch (e) {
     console.log("fancy failed: " + e.message);
-    bytes = await renderLook(env, buf, p, false);
+    bytes = await renderLook(env, buf, p, false, alpha);
     note = "\n\n⚠️ لایه‌های رنگی پیشرفته (دما، وینیت، گرین) اعمال نشد.";
   }
   const title = styleKey && STYLES[styleKey] ? "استایل " + STYLES[styleKey].label : "✨ پریست حرفه‌ای ساخته و اعمال شد";
-  return { bytes, mime: "image/jpeg", name: "result.jpg", asFile: false, preset: p, thumb,
+  if (alpha) note += "\n\n🪟 پس‌زمینه‌ی شفاف حفظ شد. فقط تنظیمات نور و رنگ اعمال شد؛ افکت‌های تمام‌کادر (وینیت، گرین، فید و دما) اعمال نشد چون شفافیت رو خراب می‌کنن.";
+  return { bytes, mime: alpha ? "image/png" : "image/jpeg", name: alpha ? "result.png" : "result.jpg", asFile: !!alpha, preset: p, thumb,
     caption: title + "\n\n" + describe(p) + note };
 }
 
@@ -301,8 +346,15 @@ async function segmentPng(env, buf) {
   return (await env.IMAGES.input(bs(buf)).transform({ width: 2048, height: 2048, fit: "scale-down" })
     .transform({ segment: "foreground" }).output({ format: "image/png" })).response().arrayBuffer();
 }
-async function doBg(env, buf, kind, arg) {
-  const fg = await segmentPng(env, buf);
+async function doBg(env, buf, kind, arg, alpha) {
+  let fg;
+  if (alpha) {
+    if (kind === "blur") throw new Error("این عکس از قبل پس‌زمینه‌ی شفاف داره، پس بلور کردن بک‌گراند معنی نداره. از «🖼 تغییر بک‌گراند» استفاده کن.");
+    fg = await (await env.IMAGES.input(bs(buf)).transform({ width: 2048, height: 2048, fit: "scale-down" })
+      .output({ format: "image/png" })).response().arrayBuffer();
+    if (kind === "bg") return { bytes: fg, mime: "image/png", name: "result.png", asFile: true,
+      caption: "✅ این PNG از قبل پس‌زمینه‌ی شفاف داشت، پس دوباره برشش ندادم و همه‌ی جزئیات (مثل بخش‌های مشکی) سالم موند." };
+  } else fg = await segmentPng(env, buf);
   if (kind === "bg") return { bytes: fg, mime: "image/png", name: "result.png", asFile: true, caption: "✂️ بک‌گراند حذف شد (PNG با پس‌زمینه‌ی شفاف)\n\nنکته: اگه بخشی از سوژه سیاه یا خیلی تیره بوده و با پس‌زمینه‌ی تیره قاطی شده، هوش مصنوعی نمی‌تونه تشخیصش بده و جا می‌افته. برای نتیجه‌ی کامل، عکسی با پس‌زمینه‌ی روشن‌تر یا فایل اصلی سوژه رو بفرست." };
   const info = await env.IMAGES.info(bs(fg));
   const W = info.width, H = info.height;
@@ -320,14 +372,14 @@ async function doBg(env, buf, kind, arg) {
 }
 
 // ================= افزایش وضوح =================
-async function doUpscale(env, buf) {
+async function doUpscale(env, buf, alpha) {
   const info = await env.IMAGES.info(bs(buf));
   const f = Math.min(2, 4096 / Math.max(info.width, info.height));
   if (f < 1.05) throw new Error("این عکس از قبل خیلی بزرگه (بیشتر از ۴۰۹۶ پیکسل)");
   const w = Math.round(info.width * f), h = Math.round(info.height * f);
   const bytes = await (await env.IMAGES.input(bs(buf)).transform({ width: w, height: h, fit: "contain" })
-    .transform({ sharpen: 1.5 }).output({ format: "image/jpeg", quality: 95 })).response().arrayBuffer();
-  return { bytes, mime: "image/jpeg", name: "result.jpg", asFile: true,
+    .transform({ sharpen: 1.5 }).output(alpha ? { format: "image/png" } : { format: "image/jpeg", quality: 95 })).response().arrayBuffer();
+  return { bytes, mime: alpha ? "image/png" : "image/jpeg", name: alpha ? "result.png" : "result.jpg", asFile: true,
     caption: "🔍 اندازه‌ی عکس از " + info.width + "×" + info.height + " به " + w + "×" + h + " رسید و وضوحش بیشتر شد.\n(این بزرگ‌نمایی با الگوریتم است، نه هوش مصنوعی؛ جزئیات جدید نمی‌سازه.)" };
 }
 
@@ -424,7 +476,7 @@ async function smartChat(env, chat, text, ss, t0) {
   try { hist = JSON.parse((await env.STATE.get("h:" + chat)) || "[]"); } catch (e) {}
   const cur = mergePreset(ss.cur || NEUTRAL, ss.cur || NEUTRAL);
   const out = await llm(env, [
-    { role: "system", content: routerPrompt(cur, ss.desc) }, ...hist,
+    { role: "system", content: routerPrompt(cur, (ss.desc || "") + (ss.alpha ? " NOTE: this image is a PNG that already has a transparent background (do not choose bg remove)." : "")) }, ...hist,
     { role: "user", content: [{ type: "text", text: text.slice(0, 1500) }, { type: "image_url", image_url: { url: "data:image/jpeg;base64," + ss.thumb } }] },
   ], 300, 16000);
   let j = null;
@@ -445,7 +497,7 @@ async function smartChat(env, chat, text, ss, t0) {
       const p = mergePreset(cur, j.preset);
       await send(chat, "🎛 دارم تغییرات رو اعمال می‌کنم... ⏳");
       const buf = await downloadById(ss.id);
-      const r = await doEnhance(env, buf, "", ss.thumb, { ...p, note: reply.slice(0, 200) });
+      const r = await doEnhance(env, buf, "", ss.thumb, { ...p, note: reply.slice(0, 200) }, ss.alpha);
       await putSession(env, chat, { ...ss, cur: p, preset: describe(p).slice(0, 700) });
       await remember(env, chat, hist, text, reply || "تغییرات اعمال شد");
       return deliver(chat, r);
@@ -507,17 +559,18 @@ async function autoProcess(env, chat, fileId, st) {
   await trace(env, "1) دانلود عکس");
   const buf = await downloadById(fileId);
   await trace(env, "2) ساخت نسخه‌ی کوچک");
+  const alpha = await isTransparent(env, buf);
   const thumb = await makeThumb(env, buf);
-  await putSession(env, chat, { id: fileId, thumb });
+  await putSession(env, chat, { id: fileId, thumb, alpha });
   st.saved = true;
-  await send(chat, "✅ عکس توی حافظه‌ی هوش مصنوعی ذخیره شد.\nدارم تحلیلش می‌کنم و پریست می‌سازم... تا اون موقع می‌تونی از دکمه‌ها استفاده کنی یا درباره‌ی عکس ازم بپرسی 💬", KEY_MAIN);
+  await send(chat, "✅ عکس توی حافظه‌ی هوش مصنوعی ذخیره شد." + (alpha ? "\n🪟 این PNG پس‌زمینه‌ی شفاف داره؛ شفافیتش رو حفظ می‌کنم." : "") + "\nدارم تحلیلش می‌کنم و پریست می‌سازم... تا اون موقع می‌تونی از دکمه‌ها استفاده کنی یا درباره‌ی عکس ازم بپرسی 💬", KEY_MAIN);
   await trace(env, "3) تحلیل هوش مصنوعی");
   const p = await makePreset(env, thumb, "", 16000);
-  await putSession(env, chat, { id: fileId, thumb, desc: p.desc || "", cur: nums(p), preset: describe(p).slice(0, 700) });
+  await putSession(env, chat, { id: fileId, thumb, alpha, desc: p.desc || "", cur: nums(p), preset: describe(p).slice(0, 700) });
   await trace(env, "4) تحلیل تموم شد (" + Math.round((Date.now() - t0) / 1000) + " ثانیه)");
   if (p.desc) await send(chat, "🔎 تحلیل هوش مصنوعی:\n" + p.desc);
   if (Date.now() - t0 > 14000) return send(chat, "⏱ تحلیل کمی طول کشید. برای اعمال پریست روی «✨ پریست هوشمند» بزن.");
-  const r = await doEnhance(env, buf, "", thumb, p);
+  const r = await doEnhance(env, buf, "", thumb, p, alpha);
   await deliver(chat, r);
   await trace(env, "5) پریست اعمال و ارسال شد (" + Math.round((Date.now() - t0) / 1000) + " ثانیه)");
 }
@@ -557,18 +610,18 @@ async function runAction(env, chat, action) {
   await send(chat, "⏳ در حال پردازش... ممکنه تا ۳۰ ثانیه طول بکشه");
   const buf = await downloadById(ss.id);
   let r;
-  if (kind === "enh" && ss.cur) r = await doEnhance(env, buf, "", ss.thumb, { ...ss.cur, note: "پریستی که هوش مصنوعی برای این عکس ساخته بود", desc: "" });
+  if (kind === "enh" && ss.cur) r = await doEnhance(env, buf, "", ss.thumb, { ...ss.cur, note: "پریستی که هوش مصنوعی برای این عکس ساخته بود", desc: "" }, ss.alpha);
   else if (kind === "enh" || kind === "regen") {
     const thumb = ss.thumb || (await makeThumb(env, buf));
     const p = await makePreset(env, thumb, "", 18000);
     await putSession(env, chat, { ...ss, thumb, desc: p.desc || ss.desc || "", cur: nums(p), preset: describe(p).slice(0, 700) });
-    r = await doEnhance(env, buf, "", thumb, p);
+    r = await doEnhance(env, buf, "", thumb, p, ss.alpha);
     if (p.desc) r.caption = "🔎 تحلیل هوش مصنوعی:\n" + p.desc + "\n\n" + r.caption;
   }
-  else if (kind === "sty") r = await doEnhance(env, buf, arg, ss.thumb);
-  else if (kind === "bg" || kind === "blur") r = await doBg(env, buf, kind);
-  else if (kind === "bgc") r = await doBg(env, buf, "bgc", arg);
-  else if (kind === "up") r = await doUpscale(env, buf);
+  else if (kind === "sty") r = await doEnhance(env, buf, arg, ss.thumb, undefined, ss.alpha);
+  else if (kind === "bg" || kind === "blur") r = await doBg(env, buf, kind, undefined, ss.alpha);
+  else if (kind === "bgc") r = await doBg(env, buf, "bgc", arg, ss.alpha);
+  else if (kind === "up") r = await doUpscale(env, buf, ss.alpha);
   else return send(chat, "این دکمه رو نمی‌شناسم 🤔");
   await deliver(chat, r);
 }
