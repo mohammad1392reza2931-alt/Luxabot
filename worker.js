@@ -5,20 +5,18 @@ const API = "https://botapi.rubika.ir/v3/";
 
 // مدل‌های متنی/بینایی (اگه اولی جواب نداد، دومی امتحان می‌شه)
 const AI_MODELS = [
-  { id: "@cf/meta/llama-4-scout-17b-16e-instruct", tokensKey: "max_tokens", tokens: 700 },
-  { id: "@cf/google/gemma-4-26b-a4b-it", tokensKey: "max_completion_tokens", tokens: 1500 },
+  { id: "@cf/meta/llama-4-scout-17b-16e-instruct", tokensKey: "max_tokens", tokens: 700, timeout: 14000 },
+  { id: "@cf/google/gemma-4-26b-a4b-it", tokensKey: "max_completion_tokens", tokens: 900, timeout: 16000 },
 ];
 const EDIT_MODEL = "@cf/black-forest-labs/flux-2-klein-4b"; // ویرایش عکس با دستور متنی
 
 const WELCOME =
   "سلام 👋 من دستیار هوشمند و استودیوی عکس تو هستم!\n\n" +
-  "💬 هر سؤالی داری بنویس، باهات حرف می‌زنم\n" +
-  "📷 عکس بفرست: خودم تحلیلش می‌کنم، یه پریست حرفه‌ای مخصوص همون عکس می‌سازم و اعمال می‌کنم. بعدش هم می‌تونی درباره‌ی عکس ازم سؤال بپرسی. ابزارهای بیشتر:\n" +
-  "🎨 استایل‌های سینمایی، وینتیج، سیاه‌وسفید و...\n" +
-  "✂️ حذف / بلور / تغییر بک‌گراند\n" +
-  "🔍 افزایش وضوح ۲ برابر\n" +
-  "🪄 ویرایش با دستور (مثلاً «ماشین پشتی رو حذف کن»)\n\n" +
-  "🗑 پاک کردن حافظه‌ی گفتگو: /new  |  نمایش منوی عکس: /menu";
+  "💬 هر سؤالی داری بنویس، باهات حرف می‌زنم\n\n" +
+  "📷 عکس که بفرستی، توی حافظه‌ی من می‌مونه. خودم تحلیلش می‌کنم و یه پریست حرفه‌ای مخصوص همون عکس می‌سازم. بعدش:\n" +
+  "• با دکمه‌ها ویرایشش کن (پریست، استایل، بک‌گراند، وضوح، حذف اشیا)\n" +
+  "• یا فقط بنویس! مثلاً «گرم‌ترش کن»، «بک‌گراندش رو بلور کن»، «ماشین پشتی رو حذف کن» یا «نورش چطوره؟»\n\n" +
+  "🗑 پاک کردن حافظه‌ی گفتگو: /new  |  نمایش دکمه‌ها: /menu\n\n";
 
 let TOKEN = "";
 const RECENT = new Map();
@@ -51,10 +49,10 @@ async function upload(type, blob, name) {
 const btn = (id, text) => ({ id, type: "Simple", button_text: text });
 const KEY_MAIN = {
   rows: [
-    { buttons: [btn("enh", "🔄 پریست جدید"), btn("menu:sty", "🎨 استایل‌ها")] },
+    { buttons: [btn("enh", "✨ پریست هوشمند"), btn("regen", "🔄 پریست جدید")] },
+    { buttons: [btn("menu:sty", "🎨 استایل‌ها"), btn("edit", "🪄 ویرایش با دستور")] },
     { buttons: [btn("bg", "✂️ حذف بک‌گراند"), btn("blur", "🌫 پرتره (بلور)")] },
     { buttons: [btn("menu:bg", "🖼 تغییر بک‌گراند"), btn("up", "🔍 وضوح ۲×")] },
-    { buttons: [btn("edit", "🪄 ویرایش با دستور (حذف اشیا و...)")] },
   ],
 };
 
@@ -155,14 +153,20 @@ function outText(r) {
   if (r.choices && r.choices[0] && r.choices[0].message) return r.choices[0].message.content || "";
   return typeof r === "string" ? r : "";
 }
-async function llm(env, messages, extraTokens) {
+async function llm(env, messages, extraTokens, budget) {
+  const t0 = Date.now(), total = budget || 20000;
   for (const mdl of AI_MODELS) {
+    const left = total - (Date.now() - t0);
+    if (left < 4000) break;
+    let timer;
     try {
       const body = { messages };
       body[mdl.tokensKey] = mdl.tokens + (extraTokens || 0);
-      const out = outText(await env.AI.run(mdl.id, body));
+      const to = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("timeout")), Math.min(left, mdl.timeout)); });
+      const out = outText(await Promise.race([env.AI.run(mdl.id, body), to]));
       if (out && (typeof out === "object" || String(out).trim())) return out;
     } catch (e) { console.log("LLM " + mdl.id + ": " + e.message); }
+    finally { clearTimeout(timer); }
   }
   return "";
 }
@@ -219,7 +223,7 @@ async function makeThumb(env, buf) {
     .output({ format: "image/jpeg", quality: 70 })).response().arrayBuffer();
   return toB64(new Uint8Array(small));
 }
-async function makePreset(env, thumb, styleKey) {
+async function makePreset(env, thumb, styleKey, budget) {
   const style = STYLES[styleKey];
   let p = null;
   try {
@@ -229,7 +233,7 @@ async function makePreset(env, thumb, styleKey) {
         { type: "text", text: presetPrompt(style) },
         { type: "image_url", image_url: { url: "data:image/jpeg;base64," + thumb } },
       ],
-    }]);
+    }], 0, budget || 18000);
     p = parsePreset(out, style);
   } catch (e) { console.log("preset error: " + e.message); }
   if (!p) p = { ...(style ? style.def : BASE_DEFAULT), note: "هوش مصنوعی جواب نداد؛ پریست آماده اعمال شد.", desc: "" };
@@ -299,7 +303,7 @@ async function segmentPng(env, buf) {
 }
 async function doBg(env, buf, kind, arg) {
   const fg = await segmentPng(env, buf);
-  if (kind === "bg") return { bytes: fg, mime: "image/png", name: "result.png", asFile: true, caption: "✂️ بک‌گراند حذف شد (PNG با پس‌زمینه‌ی شفاف)" };
+  if (kind === "bg") return { bytes: fg, mime: "image/png", name: "result.png", asFile: true, caption: "✂️ بک‌گراند حذف شد (PNG با پس‌زمینه‌ی شفاف)\n\nنکته: اگه بخشی از سوژه سیاه یا خیلی تیره بوده و با پس‌زمینه‌ی تیره قاطی شده، هوش مصنوعی نمی‌تونه تشخیصش بده و جا می‌افته. برای نتیجه‌ی کامل، عکسی با پس‌زمینه‌ی روشن‌تر یا فایل اصلی سوژه رو بفرست." };
   const info = await env.IMAGES.info(bs(fg));
   const W = info.width, H = info.height;
   let img;
@@ -328,24 +332,44 @@ async function doUpscale(env, buf) {
 }
 
 // ================= ویرایش با دستور (حذف اشیا و...) =================
-async function doAiEdit(env, buf, instruction) {
-  let en = await llm(env, [
+async function doAiEdit(env, buf, instruction, isEnglish) {
+  let en = isEnglish ? instruction : await llm(env, [
     { role: "system", content: "Convert the user's image-editing request (Persian or English) into one short, precise English instruction for an AI image editor. Reply with the instruction only." },
     { role: "user", content: instruction.slice(0, 500) },
-  ], -250);
+  ], -250, 6000);
   en = typeof en === "string" && en.trim() ? en.trim().replace(/^["']|["']$/g, "") : instruction;
   const small = await (await env.IMAGES.input(bs(buf)).transform({ width: 504, height: 504, fit: "scale-down" })
     .output({ format: "image/jpeg", quality: 92 })).response().arrayBuffer();
   const inf = await env.IMAGES.info(bs(small));
   const sc = 1024 / Math.max(inf.width, inf.height);
   const dim = (v) => Math.max(256, Math.min(1920, Math.round((v * sc) / 16) * 16));
-  const form = new FormData();
-  form.append("prompt", en + ". Keep everything else in the image unchanged.");
-  form.append("input_image_0", new Blob([small], { type: "image/jpeg" }), "in.jpg");
-  form.append("width", String(dim(inf.width)));
-  form.append("height", String(dim(inf.height)));
-  const fr = new Response(form);
-  const res = await env.AI.run(EDIT_MODEL, { multipart: { body: fr.body, contentType: fr.headers.get("content-type") } });
+  const prompts = [en + ". Keep everything else in the image unchanged.", "Photo retouching: " + en];
+  let res = null, lastErr = null;
+  for (let i = 0; i < prompts.length; i++) {
+    let timer;
+    try {
+      const form = new FormData();
+      form.append("prompt", prompts[i]);
+      form.append("input_image_0", new Blob([small], { type: "image/jpeg" }), "in.jpg");
+      form.append("width", String(dim(inf.width)));
+      form.append("height", String(dim(inf.height)));
+      const fr = new Response(form);
+      const to = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("مدل ویرایش زیادی طول کشید؛ یه بار دیگه امتحان کن")), 20000); });
+      res = await Promise.race([env.AI.run(EDIT_MODEL, { multipart: { body: fr.body, contentType: fr.headers.get("content-type") } }), to]);
+      clearTimeout(timer);
+      lastErr = null;
+      break;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (!/3030|flagged/i.test(String(e.message))) break; // فقط برای رد شدن توسط فیلتر ایمنی دوباره امتحان می‌کنیم
+    }
+  }
+  if (lastErr) {
+    if (/3030|flagged/i.test(String(lastErr.message)))
+      throw new Error("فیلتر ایمنی مدل ویرایش (خطای ۳۰۳۰) خروجی رو رد کرد، حتی بعد از دوباره‌امتحان. این فیلتر مال خود مدله و قابل خاموش کردن نیست؛ بعضی وقت‌ها اشتباهی فعال می‌شه. دستور رو یه جور دیگه یا ساده‌تر بنویس. برای حذف بک‌گراند از دکمه‌ی ✂️ استفاده کن.");
+    throw lastErr;
+  }
   if (!res || typeof res.image !== "string") throw new Error("مدل ویرایش خروجی نداد");
   const bytes = fromB64(res.image);
   const jpg = bytes[0] === 0xff && bytes[1] === 0xd8;
@@ -362,20 +386,98 @@ const HISTORY_LIMIT = 8;
 async function chatReply(env, chat, userText) {
   let hist = [];
   try { hist = JSON.parse((await env.STATE.get("h:" + chat)) || "[]"); } catch (e) {}
-  const ss = await getSession(env, chat);
-  let sys = SYSTEM_PROMPT, content = userText.slice(0, 2000);
-  if (ss && ss.thumb) {
-    sys += "\n\n[کاربر اخیراً عکسی فرستاده و تو اون رو تحلیل و ویرایش کردی. تحلیل تو: " + (ss.desc || "—") +
-      "\nپریست اعمال‌شده:\n" + (ss.preset || "—") +
-      "\nتصویر عکس به پیام آخر کاربر ضمیمه شده. اگه سؤالش درباره‌ی عکسه، با نگاه به تصویر جواب بده (نور، رنگ، ترکیب‌بندی، دلیل انتخاب پریست، پیشنهاد برای ویرایش بهتر).]";
-    content = [{ type: "text", text: content }, { type: "image_url", image_url: { url: "data:image/jpeg;base64," + ss.thumb } }];
-  }
-  const out = await llm(env, [{ role: "system", content: sys }, ...hist, { role: "user", content }], 400);
+  const out = await llm(env, [{ role: "system", content: SYSTEM_PROMPT }, ...hist, { role: "user", content: userText.slice(0, 2000) }], 400, 22000);
   const answer = typeof out === "string" ? out.trim() : "";
-  if (!answer) throw new Error("هوش مصنوعی جواب نداد (شاید سهمیه‌ی رایگان امروز تموم شده)");
-  hist.push({ role: "user", content: userText.slice(0, 600) }, { role: "assistant", content: answer.slice(0, 900) });
-  await env.STATE.put("h:" + chat, JSON.stringify(hist.slice(-HISTORY_LIMIT)), { expirationTtl: 86400 });
+  if (!answer) throw new Error("هوش مصنوعی جواب نداد (شاید سهمیه‌ی رایگان امروز تموم شده یا سرور شلوغه)");
+  await remember(env, chat, hist, userText, answer);
   return answer.slice(0, 3800);
+}
+async function remember(env, chat, hist, userText, answer) {
+  hist.push({ role: "user", content: userText.slice(0, 600) }, { role: "assistant", content: String(answer).slice(0, 900) });
+  await env.STATE.put("h:" + chat, JSON.stringify(hist.slice(-HISTORY_LIMIT)), { expirationTtl: 86400 });
+}
+
+// ================= گفتگوی هوشمند درباره‌ی عکس (چت + ویرایش با صحبت) =================
+const NEUTRAL = { brightness: 1, contrast: 1, gamma: 1, saturation: 1, sharpen: 0, warmth: 0, tint: 0, fade: 0, vignette: 0, grain: 0 };
+const RANGES = { brightness: [0.8, 1.35], contrast: [0.85, 1.3], gamma: [0.8, 1.4], saturation: [0, 1.5], sharpen: [0, 4], warmth: [-1, 1], tint: [-1, 1], fade: [0, 1], vignette: [0, 1], grain: [0, 1] };
+function mergePreset(cur, o) {
+  const p = {};
+  for (const k of PKEYS) p[k] = num(o && o[k], RANGES[k][0], RANGES[k][1], num(cur && cur[k], RANGES[k][0], RANGES[k][1], NEUTRAL[k]));
+  return p;
+}
+const nums = (p) => mergePreset(p, p);
+function routerPrompt(cur, desc) {
+  return "You are the brain of a Persian photo-editing assistant inside a chat bot. The user's photo is attached to the last message. " +
+    "Decide what the user wants and reply with ONLY one JSON object, no other text, in one of these forms:\n" +
+    '{"intent":"chat","reply":"<answer in friendly Persian>"} for questions or conversation about the photo or anything else;\n' +
+    '{"intent":"adjust","preset":{"brightness":1,"contrast":1,"gamma":1,"saturation":1,"sharpen":0,"warmth":0,"tint":0,"fade":0,"vignette":0,"grain":0},"reply":"<one short Persian sentence about what you changed>"} ' +
+    "for tone/color changes (brighter, darker, warmer, cooler, more contrast, matte, vignette, grain, black and white, more saturated, sharper...). Start from the CURRENT preset and change only what the user asked;\n" +
+    '{"intent":"style","style":"cinema|warm|cool|vintage|bw|vivid"} to apply a ready-made look;\n' +
+    '{"intent":"bg","mode":"remove|blur|white|black|blue|sunset|green"} to remove, blur or replace the background;\n' +
+    '{"intent":"upscale"} to enlarge the photo;\n' +
+    '{"intent":"ai_edit","instruction":"<short English instruction>"} to remove or add objects, change the sky, colorize, or any other change of content.\n' +
+    "Ranges: brightness 0.8-1.35, contrast 0.85-1.3, gamma 0.8-1.4 (above 1 lifts shadows), saturation 0-1.5, sharpen 0-4, warmth -1..1, tint -1..1, fade 0-1, vignette 0-1, grain 0-1. " +
+    "CURRENT preset: " + JSON.stringify(cur) + ". Earlier analysis of the photo: " + (desc || "none") + ".";
+}
+async function smartChat(env, chat, text, ss, t0) {
+  let hist = [];
+  try { hist = JSON.parse((await env.STATE.get("h:" + chat)) || "[]"); } catch (e) {}
+  const cur = mergePreset(ss.cur || NEUTRAL, ss.cur || NEUTRAL);
+  const out = await llm(env, [
+    { role: "system", content: routerPrompt(cur, ss.desc) }, ...hist,
+    { role: "user", content: [{ type: "text", text: text.slice(0, 1500) }, { type: "image_url", image_url: { url: "data:image/jpeg;base64," + ss.thumb } }] },
+  ], 300, 16000);
+  let j = null;
+  if (out && typeof out === "object") j = out;
+  else if (typeof out === "string") {
+    const m = out.replace(/```json|```/g, "").match(/\{[\s\S]*\}/);
+    if (m) { try { j = JSON.parse(m[0]); } catch (e) {} }
+  }
+  if (!j || !j.intent) {
+    const plain = typeof out === "string" ? out.trim() : "";
+    if (!plain) throw new Error("هوش مصنوعی جواب نداد (شاید سهمیه‌ی رایگان امروز تموم شده یا سرور شلوغه)");
+    await remember(env, chat, hist, text, plain);
+    return send(chat, plain.slice(0, 3800));
+  }
+  const reply = String(j.reply || "").trim();
+  switch (j.intent) {
+    case "adjust": {
+      const p = mergePreset(cur, j.preset);
+      await send(chat, "🎛 دارم تغییرات رو اعمال می‌کنم... ⏳");
+      const buf = await downloadById(ss.id);
+      const r = await doEnhance(env, buf, "", ss.thumb, { ...p, note: reply.slice(0, 200) });
+      await putSession(env, chat, { ...ss, cur: p, preset: describe(p).slice(0, 700) });
+      await remember(env, chat, hist, text, reply || "تغییرات اعمال شد");
+      return deliver(chat, r);
+    }
+    case "style":
+      if (STYLES[j.style]) { await remember(env, chat, hist, text, "استایل " + j.style + " اعمال شد"); return runAction(env, chat, "sty:" + j.style); }
+      break;
+    case "bg": {
+      const mode = String(j.mode || "");
+      const act = mode === "remove" ? "bg" : mode === "blur" ? "blur" : BGS[mode] ? "bgc:" + mode : "";
+      if (act) { await remember(env, chat, hist, text, "بک‌گراند تغییر کرد: " + mode); return runAction(env, chat, act); }
+      break;
+    }
+    case "upscale":
+      await remember(env, chat, hist, text, "وضوح عکس بیشتر شد");
+      return runAction(env, chat, "up");
+    case "ai_edit": {
+      const ins = String(j.instruction || "").trim();
+      if (!ins) break;
+      await remember(env, chat, hist, text, "ویرایش با دستور: " + ins);
+      if (Date.now() - t0 > 10000) {
+        // برای اینکه از زمان مجاز Worker بیرون نزنیم، اجرا رو به یه دکمه می‌سپریم
+        await env.STATE.put("e:" + chat, ins, { expirationTtl: 900 });
+        return send(chat, "🪄 فهمیدم: " + ins + "\nبرای اجرا روی دکمه بزن 👇", { rows: [{ buttons: [btn("runedit", "▶️ اجرا")] }] });
+      }
+      await send(chat, "🪄 در حال ویرایش... (۱۵ تا ۶۰ ثانیه)");
+      return deliver(chat, await doAiEdit(env, await downloadById(ss.id), ins, true));
+    }
+  }
+  const fallback = reply || "متوجه نشدم، یه جور دیگه بگو 🙂";
+  await remember(env, chat, hist, text, fallback);
+  return send(chat, fallback.slice(0, 3800));
 }
 
 // ================= کنترل اصلی =================
@@ -383,6 +485,12 @@ async function getSession(env, chat) {
   const raw = await env.STATE.get("u:" + chat);
   if (!raw) return null;
   try { return JSON.parse(raw); } catch (e) { return null; }
+}
+async function putSession(env, chat, obj) {
+  await env.STATE.put("u:" + chat, JSON.stringify(obj), { expirationTtl: 86400 });
+}
+async function trace(env, s) {
+  try { await env.STATE.put("trace", new Date().toISOString().slice(11, 19) + " | " + s, { expirationTtl: 3600 }); } catch (e) {}
 }
 async function downloadById(fileId) {
   const info = await rub("getFile", { file_id: fileId });
@@ -392,22 +500,26 @@ async function downloadById(fileId) {
   if (!dl.ok) throw new Error("دانلود عکس ناموفق بود (" + dl.status + ")");
   return dl.arrayBuffer();
 }
-async function downloadPhoto(env, chat) {
-  const ss = await getSession(env, chat);
-  return ss ? downloadById(ss.id) : null;
-}
-// عکس که برسه: تحلیل خودکار + ساخت پریست + اعمال
+// عکس که برسه: اول ذخیره + دکمه‌ها، بعد تحلیل هوش مصنوعی، بعد (اگه وقت بود) اعمال پریست
 async function autoProcess(env, chat, fileId, st) {
-  await send(chat, "📷 عکس رسید! در حال تحلیل و ساخت پریست حرفه‌ای... ⏳ (حدود ۳۰ ثانیه)");
+  const t0 = Date.now();
+  await send(chat, "📷 عکس رسید، دارم ذخیره‌ش می‌کنم...");
+  await trace(env, "1) دانلود عکس");
   const buf = await downloadById(fileId);
+  await trace(env, "2) ساخت نسخه‌ی کوچک");
   const thumb = await makeThumb(env, buf);
-  const p = await makePreset(env, thumb, "");
-  await env.STATE.put("u:" + chat, JSON.stringify({ id: fileId, thumb, desc: p.desc || "", preset: describe(p).slice(0, 700) }), { expirationTtl: 86400 });
+  await putSession(env, chat, { id: fileId, thumb });
   st.saved = true;
+  await send(chat, "✅ عکس توی حافظه‌ی هوش مصنوعی ذخیره شد.\nدارم تحلیلش می‌کنم و پریست می‌سازم... تا اون موقع می‌تونی از دکمه‌ها استفاده کنی یا درباره‌ی عکس ازم بپرسی 💬", KEY_MAIN);
+  await trace(env, "3) تحلیل هوش مصنوعی");
+  const p = await makePreset(env, thumb, "", 16000);
+  await putSession(env, chat, { id: fileId, thumb, desc: p.desc || "", cur: nums(p), preset: describe(p).slice(0, 700) });
+  await trace(env, "4) تحلیل تموم شد (" + Math.round((Date.now() - t0) / 1000) + " ثانیه)");
+  if (p.desc) await send(chat, "🔎 تحلیل هوش مصنوعی:\n" + p.desc);
+  if (Date.now() - t0 > 14000) return send(chat, "⏱ تحلیل کمی طول کشید. برای اعمال پریست روی «✨ پریست هوشمند» بزن.");
   const r = await doEnhance(env, buf, "", thumb, p);
-  if (p.desc) r.caption = "🔎 تحلیل هوش مصنوعی:\n" + p.desc + "\n\n" + r.caption;
   await deliver(chat, r);
-  await send(chat, "حالا می‌تونی درباره‌ی این عکس ازم سؤال بپرسی 💬 یا یکی از ابزارهای بیشتر رو بزنی 👇", KEY_MAIN);
+  await trace(env, "5) پریست اعمال و ارسال شد (" + Math.round((Date.now() - t0) / 1000) + " ثانیه)");
 }
 async function deliver(chat, r) {
   const blob = new Blob([r.bytes], { type: r.mime });
@@ -433,13 +545,26 @@ async function runAction(env, chat, action) {
   const ss = await getSession(env, chat);
   if (!ss) return send(chat, "اول یه عکس بفرست 📷");
   if (kind === "edit") {
-    await env.STATE.put("m:" + chat, "edit", { expirationTtl: 600 });
-    return send(chat, "🪄 دستورت رو بنویس (فارسی یا انگلیسی). مثلاً:\n• ماشین پشت سر رو حذف کن\n• آسمون رو غروب کن\n• عکس رو رنگی کن\n• عینک رو بردار");
+    return send(chat, "🪄 فقط بنویس چی می‌خوای؛ خودم تشخیص می‌دم کدوم ابزار لازمه. مثلاً:\n• ماشین پشت سر رو حذف کن\n• آسمون رو غروب کن\n• عکس رو رنگی کن\n• عینک رو بردار");
+  }
+  if (kind === "runedit") {
+    const ins = await env.STATE.get("e:" + chat);
+    if (!ins) return send(chat, "دستور منقضی شده؛ دوباره بنویسش 🙂");
+    await env.STATE.delete("e:" + chat);
+    await send(chat, "🪄 در حال ویرایش... (۱۵ تا ۶۰ ثانیه)");
+    return deliver(chat, await doAiEdit(env, await downloadById(ss.id), ins, true));
   }
   await send(chat, "⏳ در حال پردازش... ممکنه تا ۳۰ ثانیه طول بکشه");
   const buf = await downloadById(ss.id);
   let r;
-  if (kind === "enh") r = await doEnhance(env, buf, "", ss.thumb);
+  if (kind === "enh" && ss.cur) r = await doEnhance(env, buf, "", ss.thumb, { ...ss.cur, note: "پریستی که هوش مصنوعی برای این عکس ساخته بود", desc: "" });
+  else if (kind === "enh" || kind === "regen") {
+    const thumb = ss.thumb || (await makeThumb(env, buf));
+    const p = await makePreset(env, thumb, "", 18000);
+    await putSession(env, chat, { ...ss, thumb, desc: p.desc || ss.desc || "", cur: nums(p), preset: describe(p).slice(0, 700) });
+    r = await doEnhance(env, buf, "", thumb, p);
+    if (p.desc) r.caption = "🔎 تحلیل هوش مصنوعی:\n" + p.desc + "\n\n" + r.caption;
+  }
   else if (kind === "sty") r = await doEnhance(env, buf, arg, ss.thumb);
   else if (kind === "bg" || kind === "blur") r = await doBg(env, buf, kind);
   else if (kind === "bgc") r = await doBg(env, buf, "bgc", arg);
@@ -475,13 +600,12 @@ async function handle(env, m) {
       if (!(await getSession(env, chat))) return await send(chat, "اول یه عکس بفرست 📷");
       return await send(chat, "چه کاری روی عکس انجام بدم؟", KEY_MAIN);
     }
-    if ((await env.STATE.get("m:" + chat)) === "edit") {
-      await env.STATE.delete("m:" + chat);
-      const buf = await downloadPhoto(env, chat);
-      if (!buf) return await send(chat, "عکس منقضی شده؛ دوباره بفرستش 📷");
-      await send(chat, "🪄 در حال ویرایش... (۱۵ تا ۶۰ ثانیه)");
-      return await deliver(chat, await doAiEdit(env, buf, t));
+    const t0 = Date.now();
+    let ss = await getSession(env, chat);
+    if (ss && !ss.thumb) {
+      try { ss.thumb = await makeThumb(env, await downloadById(ss.id)); await putSession(env, chat, ss); } catch (e) { ss = null; }
     }
+    if (ss && ss.thumb) return await smartChat(env, chat, t, ss, t0);
     return await send(chat, await chatReply(env, chat, t));
   } catch (e) {
     console.log("handle error: " + e.message);
@@ -513,6 +637,7 @@ function normalize(b) {
     text: String(m.text || "").trim(),
     file: file && (file.file_id || file.id) ? file : null,
     button: m.aux_data && m.aux_data.button_id ? String(m.aux_data.button_id) : "",
+    time: m.time,
   };
 }
 async function handleUpdate(env, body) {
@@ -525,6 +650,11 @@ async function handleUpdate(env, body) {
     if (RECENT.get(k) && now - RECENT.get(k) < 20000) continue;
     RECENT.set(k, now);
     if (RECENT.size > 200) RECENT.clear();
+    const ts = Number(m.time);
+    if (ts > 1e9) {
+      const delay = Math.round((Date.now() - (ts > 1e12 ? ts : ts * 1000)) / 1000);
+      if (m.file || delay > 15) await trace(env, "پیام از روبیکا با " + delay + " ثانیه تاخیر رسید" + (m.file ? " (عکس)" : ""));
+    }
     await handle(env, m);
   }
 }
@@ -557,7 +687,7 @@ export default {
     }
     if (u.pathname === "/debug") {
       if (u.searchParams.get("t") !== TOKEN.slice(-8)) return txt("no", 403);
-      return txt((await env.STATE.get("dbg")) || "چیزی ثبت نشده.");
+      return txt("آخرین مرحله‌ی پردازش عکس:\n" + ((await env.STATE.get("trace")) || "—") + "\n\nآخرین پیام ناشناخته:\n" + ((await env.STATE.get("dbg")) || "—"));
     }
     return txt("ربات روشنه ✅");
   },
